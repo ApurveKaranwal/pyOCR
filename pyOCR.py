@@ -8,15 +8,50 @@ import re
 import json
 import argparse
 from datetime import datetime
-from bs4 import BeautifulSoup  # <-- pip install beautifulsoup4
+from bs4 import BeautifulSoup
+import sys 
 
 # ---------------- CONFIG ----------------
 # NOTE: Update these paths to match your Tesseract and Poppler installations
 TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 POPPLER_PATH = r"C:\Program Files\poppler-25.07.0\Library\bin"
 
-pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+try:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+except pytesseract.TesseractNotFoundError:
+    print(f"\n[FATAL ERROR] Tesseract not found at: {TESSERACT_PATH}")
+    print("Please update TESSERACT_PATH in the script.")
+    sys.exit(1)
 
+
+# ---------------- BLOOD TEST MAPPING ----------------
+# Comprehensive map with common OCR errors added for better coverage.
+blood_tests_map = {
+    "Hemoglobin": ["hemoglobin", "hgb", "hb", "hemeglobin"],
+    "PCV": ["pcv", "packed cell volume", "hematocrit"],
+    "RBC Count": ["rbc", "red blood cell count", "mount"], 
+    "MCV": ["mcv", "mev"],
+    "MCH": ["mch"],
+    "MCHC": ["mchc"],
+    "RDW": ["rdw", "red cell distribution width"],
+    "TLC": ["tlc", "total leukocyte count", "wbc"],
+    "Neutrophils": ["neutrophil", "segmented neutrophils", "neuophile", "neunrophils"],
+    "Lymphocytes": ["lymphocyte", "lyphocytes", "lymph"],
+    "Monocytes": ["monocyte"],
+    "Eosinophils": ["eosinophil", "eosinphils"],
+    "Basophils": ["basophil"],
+    "Absolute Neutrophil Count": ["absolute", "neuophile"],
+    "Absolute Lymphocyte Count": ["absolute", "lyphocytes", "lyphocyres"],
+    "Absolute Eosinophil Count": ["absolute", "eosinophil"],
+    "Absolute Basophil Count": ["absolute", "basophil"],
+    "Platelet Count": ["platelet", "thrombocyte", "platelet count"],
+    "MPV": ["mpv", "mean platelet volume"],
+    "Bilirubin": ["bilirubin"], "Creatinine": ["creatinine"],
+    "Glucose": ["glucose", "sugar"], "Cholesterol": ["cholesterol"],
+    "Triglyceride": ["triglyceride"], "Uric Acid": ["uric acid"],
+    "SGOT/AST": ["sgot", "ast"], "SGPT/ALT": ["sgpt", "alt"],
+    "Albumin": ["albumin"], "Protein": ["protein"],
+}
 
 # ---------------- IMAGE PREPROCESSING ----------------
 def correct_skew(img):
@@ -30,7 +65,7 @@ def correct_skew(img):
                 print(f"[INFO] Deskewing detected angle: {angle} degrees.")
                 (h, w) = img.shape[:2]
                 center = (w // 2, h // 2)
-                M = cv2.getRotationMatrix2D(center, -angle, 1.0)
+                M = cv2.getRotationMatrix2D(center, -angle, 1.0) 
                 img = cv2.warpAffine(
                     img, M, (w, h),
                     flags=cv2.INTER_CUBIC,
@@ -42,27 +77,25 @@ def correct_skew(img):
 
 
 def preprocess_image(img):
-    """Enhance image for OCR accuracy: CLAHE, Denoising, and Adaptive Thresholding."""
+    """Enhance image for OCR accuracy: Denoising, CLAHE, and Adaptive Thresholding."""
     if img is None:
         raise ValueError("Image input to preprocess_image is None.")
+        
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img 
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # 1. Denoise
-    gray = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-
-    # 2. Improve contrast
+    gray = cv2.fastNlMeansDenoising(gray, None, 8, 7, 21)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
 
-    # 3. Adaptive Threshold
     processed = cv2.adaptiveThreshold(
         enhanced, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY, 21, 10
     )
 
-    # 4. Morphological closing
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     processed = cv2.morphologyEx(processed, cv2.MORPH_CLOSE, kernel, iterations=1)
 
@@ -84,18 +117,34 @@ def image_to_hocr(image):
 
 
 # ---------------- BLOOD TEST EXTRACTION (HOCR-BASED) ----------------
-blood_tests = [
-    "hemoglobin", "rbc", "wbc", "platelet", "neutrophil", "lymphocyte",
-    "monocyte", "eosinophil", "basophil", "mcv", "mch", "mchc", "rdw",
-    "hematocrit", "esr", "bilirubin", "creatinine", "urea", "cholesterol",
-    "triglyceride", "hdl", "ldl", "vldl", "glucose", "sugar", "calcium",
-    "sodium", "potassium", "chloride", "albumin", "protein", "uric acid",
-    "sgot", "sgpt", "alt", "ast", "alkaline phosphatase", "bun", "phosphorus"
-]
-
+# Helper function to clean OCR results
+def clean_numeric_value(text, test_name=""):
+    """
+    Strips non-numeric/decimal characters and tries to fix missing decimals
+    based on typical report values.
+    """
+    # Strips common OCR junk and cleans text
+    text = text.lower().replace(',', '').replace(' ', '').strip('|>.,»:') 
+    
+    # Extract all digit/decimal patterns
+    match = re.search(r'^[<>]?(\d*\.?\d+)', text)
+    if match:
+        cleaned_value = match.group(1)
+        
+        # Aggressive cleaning for common report issues (e.g., 4500 -> 45.00 for percentages)
+        if '.' not in cleaned_value and len(cleaned_value) > 3 and 'hgb' not in test_name.lower():
+            cleaned_value = cleaned_value[:-2] + '.' + cleaned_value[-2:]
+        
+        return cleaned_value
+    
+    # If it's not a number but a dash or other non-numeric result
+    if text in ["-", "---", "negative", "trace"]:
+        return text
+        
+    return "" 
 
 def extract_blood_data_from_hocr(hocr_data):
-    """Parses HOCR data to find blood test names and their nearest numeric values."""
+    """Parses HOCR data to find blood test names and their nearest numeric values/units."""
     soup = BeautifulSoup(hocr_data, 'html.parser')
     results = {}
 
@@ -114,47 +163,69 @@ def extract_blood_data_from_hocr(hocr_data):
     for i, wd in enumerate(word_list):
         text = wd['text']
         x1, y1, x2, y2 = wd['bbox']
+        test_display_name = None
 
-        for test in blood_tests:
-            if test in text:
-                best_match = None
-                best_x_distance = float('inf')
+        # 1. Identify the Test Name
+        for display_name, search_terms in blood_tests_map.items():
+            if any(term in text for term in search_terms):
+                test_display_name = display_name
+                break 
 
-                for j in range(i + 1, min(i + 20, len(word_list))):
-                    nxt = word_list[j]
-                    nx1, ny1, nx2, ny2 = nxt['bbox']
-                    if re.match(r'^[\d\.,]+$', nxt['text'].replace(',', '')):
-                        if abs((y1 + y2) / 2 - (ny1 + ny2) / 2) < 30:
-                            x_distance = nx1 - x2
-                            if 0 < x_distance < best_x_distance:
-                                best_match = nxt
-                                best_x_distance = x_distance
+        if test_display_name and test_display_name not in results:
+            
+            best_match = None
+            best_x_distance = float('inf') 
 
-                if best_match:
-                    value = best_match['text'].replace(',', '')
-                    unit = ""
+            # 2. Search for the Numeric Result (Search 30 words forward)
+            for j in range(i + 1, min(i + 30, len(word_list))):
+                nxt = word_list[j]
+                nx1, ny1, nx2, ny2 = nxt['bbox']
+                
+                # Check for numerical value 
+                is_value = re.match(r'^[<>]?[\d\.,-/\s]+$', nxt['text'].replace(',', '').strip('|>'))
+                
+                # Loosened vertical alignment tolerance (80 pixels) - FINAL SETTING
+                if is_value and abs((y1 + y2) / 2 - (ny1 + ny2) / 2) < 80:
+                    x_distance = nx1 - x2 
+                    # Prioritize the number with the smallest horizontal gap after the test name
+                    if x_distance >= 0 and x_distance < best_x_distance:
+                        best_match = nxt
+                        best_x_distance = x_distance
 
-                    next_idx = word_list.index(best_match) + 1
-                    if next_idx < len(word_list):
-                        unit_candidate = word_list[next_idx]['text']
-                        if (len(unit_candidate) > 0 and
-                                not re.match(r'^[\d\.,]+$', unit_candidate) and
-                                len(unit_candidate) < 10):
-                            unit = unit_candidate
+            # 3. Process and Clean the Result + Extended Unit Search (Strict on Proximity)
+            if best_match:
+                value = clean_numeric_value(best_match['text'], test_display_name)
+                unit = ""
+                
+                # Search up to 5 words after the result for the Unit
+                for k in range(word_list.index(best_match) + 1, min(word_list.index(best_match) + 6, len(word_list))):
+                    unit_candidate = word_list[k]
+                    unit_text = unit_candidate['text']
+                        
+                    # Unit check: Must be on the same vertical line, short, non-numeric, AND horizontally CLOSE
+                    if (abs((y1 + y2) / 2 - (unit_candidate['bbox'][1] + unit_candidate['bbox'][3]) / 2) < 80 and 
+                        unit_candidate['bbox'][0] - best_match['bbox'][2] < 150 and # Horizontal proximity
+                        len(unit_text) > 0 and 
+                        len(unit_text) < 10 and 
+                        not re.match(r'^[\d\.,]+$', unit_text)):
+                            
+                            # Final Check: Accept any short text that isn't clearly random junk characters (like 'bb')
+                            if not re.search(r'[\!@\#\$\%\^\&\*`~]', unit_text) and unit_text not in ['be', 'bb', 'ki', 'thouknns', 'and']: 
+                                unit = unit_text
+                                break 
 
-                    results[test.title()] = f"{value} {unit}".strip()
-                break
+                results[test_display_name] = f"{value} {unit}".strip()
+                continue 
+                
     return results
 
 
 # ---------------- MAIN PROCESS ----------------
 def process_file(path):
     all_hocr = ""
-
     if path.lower().endswith(".pdf"):
         print("[INFO] Converting PDF pages to images (DPI 500) ...")
-        pages = pdf_to_images(path)
-
+        pages = convert_from_path(path, dpi=500, poppler_path=POPPLER_PATH)
         for i, page in enumerate(pages, 1):
             print(f"[INFO] Processing page {i}/{len(pages)} ...")
             img = np.array(page)
@@ -166,7 +237,7 @@ def process_file(path):
         img = cv2.imread(path)
         if img is None:
             raise FileNotFoundError(f"Could not load image file: {path}")
-
+        print("[INFO] Processing image ...")
         img = correct_skew(img)
         processed = preprocess_image(img)
         all_hocr = image_to_hocr(processed)
@@ -181,7 +252,7 @@ def save_to_json(data, input_path):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = "outputs"
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, f"{base_name}_hocr_output_{timestamp}.json")
+    output_path = os.path.join(output_dir, f"{base_name}_extracted_data_{timestamp}.json")
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
@@ -193,7 +264,7 @@ def save_to_json(data, input_path):
 # ---------------- CLI ENTRY ----------------
 def main():
     parser = argparse.ArgumentParser(description="Advanced Blood Report OCR to JSON (HOCR-based Accuracy)")
-    parser.add_argument("input", help="Path to input PDF or image file")
+    parser.add_argument("input", help="Path to input PDF or image file (e.g., main_notred.jpg)")
     args = parser.parse_args()
 
     try:
@@ -205,11 +276,12 @@ def main():
 
     except FileNotFoundError as e:
         print(f"\n[ERROR] File not found: {e}")
-        print("Please ensure the input file exists and Tesseract/Poppler paths are correct.")
+        print("Please ensure the input file exists.")
     except pytesseract.TesseractNotFoundError:
         print(f"\n[ERROR] Tesseract not found at: {TESSERACT_PATH}")
+        print("Please verify the TESSERACT_PATH in the script.")
     except Exception as e:
-        print(f"\n[CRITICAL ERROR] Unexpected error: {e}")
+        print(f"\n[CRITICAL ERROR] An unexpected error occurred: {e}")
 
 
 if __name__ == "__main__":
