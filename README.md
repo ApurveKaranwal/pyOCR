@@ -22,6 +22,7 @@ It intelligently processes files, cleans extracted data, and outputs structured 
 - **OpenCV**
 - **Pytesseract**
 - **pdf2image**
+- **BeautifulSoup**
 - **PIL (Pillow)**
 - **Poppler**
 - **re** and **json** for text processing
