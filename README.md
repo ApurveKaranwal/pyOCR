@@ -33,7 +33,7 @@ It intelligently processes files, cleans extracted data, and outputs structured 
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/yourusername/pyOCR.git
+git clone https://github.com/ApurveKaranwal/pyOCR.git
 cd pyOCR
 ```
 ### 2. Install Dependencies
